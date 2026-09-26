@@ -13,7 +13,7 @@ from urllib import error as urlerror
 
 from fastapi import FastAPI, Request
 
-app = FastAPI(title="Vera Signal-to-Action Engine", version="2.0.0")
+app = FastAPI(title="Vera Signal-to-Action Engine", version="2.2.0")
 START_TIME = time.time()
 
 # ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ MERCHANT_REPLY_HISTORY: dict[str, deque[tuple[float, str]]] = defaultdict(lambda
 MERCHANT_SEND_MEMORY: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=20))
 
 # trigger IDs already sent once (global dedup)
-SENT_TRIGGER_IDS: set[str] = set()
+SENT_TRIGGER_VERSIONS: dict[str, int] = {}
 
 INTERNAL_JARGON = {
     "suppression_key", "trigger_id", "trigger context", "merchantcontext",
@@ -403,7 +403,9 @@ def choose_triggers(available: list[str], now: str | None = None) -> list[tuple[
             if ci:
                 customer = ci["payload"]
         s = score_trigger(category, merchant, trigger, customer, now)
-        if s > -50 and tid not in SENT_TRIGGER_IDS:
+        sent_version = SENT_TRIGGER_VERSIONS.get(tid)
+        current_version = int(tinfo.get("version", 1) or 1)
+        if s > -50 and sent_version != current_version:
             candidates.append((s, trigger, category, merchant, customer))
 
     # One attention-preserving proactive message per merchant per tick.
@@ -721,12 +723,27 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
         festival = p.get("festival")
         days = p.get("days_until")
         date = p.get("date")
+        perf = merchant.get("performance", {}) or {}
+        d7 = perf.get("delta_7d", {}) or {}
+        active = first_active_offer(merchant)
         if festival:
-            body = f"{person}, {festival} is coming up"
-            if date: body += f" on {date}"
-            elif days is not None: body += f" in {days} days"
-            body += ". I’d plan the category-specific offer/content now rather than send a generic discount. Want me to draft the first version?"
-            rationale = "Uses the supplied festival timing and keeps the recommendation category-led."
+            timing = f" on {date}" if date else (f" in {days} days" if days is not None else "")
+            body = f"{person}, {festival} is coming up{timing}."
+            if days is not None and days > 45:
+                body += " You have time to test the offer angle before the booking rush."
+            elif days is not None:
+                body += " This is close enough to prepare the booking hook now."
+            if active:
+                body += f" Your live {active.get('title')} is the cleanest starting point."
+            growth = []
+            if isinstance(d7.get("views_pct"), (int, float)) and d7.get("views_pct") > 0:
+                growth.append(f"views are up {pct_abs(d7['views_pct'])}")
+            if isinstance(d7.get("calls_pct"), (int, float)) and d7.get("calls_pct") > 0:
+                growth.append(f"calls are up {pct_abs(d7['calls_pct'])}")
+            if growth:
+                body += " You’re also seeing " + " and ".join(growth[:2]) + " this week."
+            body += " Want me to draft a festival booking hook around what is already live?"
+            rationale = "Combines festival timing with the merchant's current offer and positive momentum, while avoiding an invented seasonal package."
         else:
             body = f"{person}, a festival-upcoming trigger is active, but its exact event details haven’t been supplied yet. I won’t guess. Want a reusable seasonal planning checklist for {merchant.get('identity', {}).get('locality', 'your area')}?"
             rationale = "The trigger is underspecified, so the message avoids inventing a festival name or date."
@@ -1182,7 +1199,7 @@ async def metadata() -> dict[str, Any]:
         "model": os.getenv("OPENAI_MODEL", "deterministic-with-optional-llm-polish"),
         "approach": "signal ranking + evidence guard + attention budget + conversation state", 
         "contact_email": os.getenv("CONTACT_EMAIL", ""),
-        "version": "2.1.0",
+        "version": "2.2.0",
         "submitted_at": os.getenv("SUBMITTED_AT", now_iso()),
     }
 
@@ -1220,7 +1237,8 @@ async def tick(request: Request) -> dict[str, Any]:
         key = trigger.get("suppression_key") or trigger.get("id")
         mid = merchant.get("merchant_id")
         recent = MERCHANT_SEND_MEMORY.get(mid, [])
-        if any(x.get("suppression_key") == key for x in recent):
+        trigger_version = int(CONTEXTS.get(("trigger", trigger.get("id")), {}).get("version", 1) or 1)
+        if any(x.get("suppression_key") == key and x.get("trigger_version") == trigger_version for x in recent):
             continue
 
         draft = compose(category, merchant, trigger, customer)
@@ -1255,8 +1273,8 @@ async def tick(request: Request) -> dict[str, Any]:
             "rationale": draft["rationale"],
         }
         actions.append(action)
-        SENT_TRIGGER_IDS.add(trigger.get("id"))
-        MERCHANT_SEND_MEMORY[mid].append({"ts": time.time(), "kind": trigger.get("kind"), "suppression_key": key, "trigger_id": trigger.get("id")})
+        SENT_TRIGGER_VERSIONS[trigger.get("id")] = trigger_version
+        MERCHANT_SEND_MEMORY[mid].append({"ts": time.time(), "kind": trigger.get("kind"), "suppression_key": key, "trigger_id": trigger.get("id"), "trigger_version": trigger_version})
 
     return {"actions": actions[:20]}
 
