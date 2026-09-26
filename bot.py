@@ -385,9 +385,23 @@ def choose_triggers(available: list[str], now: str | None = None) -> list[tuple[
         category = cinfo["payload"]
         customer = None
         cid = trigger.get("customer_id")
-        if cid:
+        if trigger.get("scope") == "customer":
+            # Customer-scoped triggers are only actionable when the matching
+            # CustomerContext has actually been pushed. Never route a customer
+            # trigger through the merchant-facing composer just because the
+            # customer record is temporarily unavailable.
+            if not cid:
+                continue
             ci = CONTEXTS.get(("customer", cid))
-            if ci: customer = ci["payload"]
+            if not ci:
+                continue
+            customer = ci["payload"]
+            if customer.get("merchant_id") != mid:
+                continue
+        elif cid:
+            ci = CONTEXTS.get(("customer", cid))
+            if ci:
+                customer = ci["payload"]
         s = score_trigger(category, merchant, trigger, customer, now)
         if s > -50 and tid not in SENT_TRIGGER_IDS:
             candidates.append((s, trigger, category, merchant, customer))
@@ -440,6 +454,21 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
             "rationale": f"Suppressed because trigger kind '{kind}' is not compatible with category '{slug}'; surfaced a merchant-facing data-quality hold instead of sending the wrong customer message.",
             "template_name": template_name,
             "template_params": [holder],
+            "suppressed": True,
+        }
+
+    # Customer-scoped triggers must never fall back to a merchant-facing
+    # composition when the customer record is unavailable. The correct
+    # behavior is to wait for the matching CustomerContext to arrive.
+    if trigger.get("scope") == "customer" and customer is None:
+        return {
+            "body": "",
+            "cta": "none",
+            "send_as": "merchant_on_behalf",
+            "suppression_key": trigger.get("suppression_key", trigger.get("id", kind)),
+            "rationale": "Held because this is a customer-scoped trigger but the matching CustomerContext has not been pushed yet.",
+            "template_name": template_name,
+            "template_params": [],
             "suppressed": True,
         }
 
@@ -1153,7 +1182,7 @@ async def metadata() -> dict[str, Any]:
         "model": os.getenv("OPENAI_MODEL", "deterministic-with-optional-llm-polish"),
         "approach": "signal ranking + evidence guard + attention budget + conversation state", 
         "contact_email": os.getenv("CONTACT_EMAIL", ""),
-        "version": "2.0.0",
+        "version": "2.1.0",
         "submitted_at": os.getenv("SUBMITTED_AT", now_iso()),
     }
 
