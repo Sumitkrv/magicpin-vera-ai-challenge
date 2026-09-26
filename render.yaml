@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: vera-signal-to-action
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn bot:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /v1/healthz
